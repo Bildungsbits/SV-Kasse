@@ -1,0 +1,7 @@
+node_modules
+node_modules.nosync
+dist
+.wrangler
+.wrangler.nosync
+.dev.vars
+.DS_Store
