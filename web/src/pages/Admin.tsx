@@ -1,6 +1,6 @@
 import { useEffect, useState } from "preact/hooks";
 import { parseEuro } from "../../../src/shared/money";
-import { ApiError, api, errMsg, go } from "../api";
+import { ApiError, api, errMsg, go, setAdminToken } from "../api";
 import { csvLine, download, fmtDate, fmtDateTime, fmtTime, todayIso } from "../format";
 import { rangeReportPdf, shiftReportPdf } from "../pdf";
 import type { Article, Report, Settings, ShiftRow, Stats, StockMovement } from "../types";
@@ -16,20 +16,16 @@ const TABS: [Tab, string][] = [
 ];
 
 export function Admin() {
-  const [authed, setAuthed] = useState<boolean | null>(null);
+  const [authed, setAuthed] = useState(false);
   const [tab, setTab] = useState<Tab>("shifts");
 
-  useEffect(() => {
-    api("/api/admin/me")
-      .then(() => setAuthed(true))
-      .catch(() => setAuthed(false));
-  }, []);
+  // Beim Verlassen des Adminbereichs wird die Anmeldung verworfen
+  useEffect(() => () => setAdminToken(null), []);
 
-  if (authed === null) return <p class="empty">Lade …</p>;
   if (!authed) return <Login onDone={() => setAuthed(true)} />;
 
-  async function logout() {
-    await api("/api/admin/logout", "POST").catch(() => {});
+  function logout() {
+    setAdminToken(null);
     setAuthed(false);
   }
 
@@ -66,6 +62,7 @@ export function Admin() {
 function useAuthGuard() {
   return (e: unknown) => {
     if (e instanceof ApiError && e.status === 401) {
+      setAdminToken(null);
       toast("Sitzung abgelaufen. Bitte neu anmelden.", "err");
       setTimeout(() => location.reload(), 800);
     } else toast(errMsg(e), "err");
@@ -83,7 +80,9 @@ function Login(props: { onDone: () => void }) {
     setBusy(true);
     setError("");
     try {
-      await api("/api/admin/login", "POST", { password: pw });
+      const r = await api<{ token: string }>("/api/admin/login", "POST", { password: pw });
+      setAdminToken(r.token);
+      setPw("");
       props.onDone();
     } catch (err) {
       setError(errMsg(err));
@@ -100,7 +99,7 @@ function Login(props: { onDone: () => void }) {
         <h1>Adminbereich</h1>
         <label class="field" style="margin-top:1.2rem;text-align:left">
           <span>Passwort</span>
-          <input type="password" autoFocus autoComplete="current-password" value={pw} onInput={(e) => setPw((e.target as HTMLInputElement).value)} />
+          <input type="password" autoFocus autoComplete="off" name="sv-admin-code" value={pw} onInput={(e) => setPw((e.target as HTMLInputElement).value)} />
         </label>
         {error && (
           <p class="err" role="alert">
@@ -963,7 +962,7 @@ function SettingsTab() {
         <div class="grid2">
           <label class="field">
             <span>Aktuelles Passwort</span>
-            <input type="password" autoComplete="current-password" value={cur} onInput={(e) => setCur((e.target as HTMLInputElement).value)} />
+            <input type="password" autoComplete="off" value={cur} onInput={(e) => setCur((e.target as HTMLInputElement).value)} />
           </label>
           <label class="field">
             <span>Neues Passwort (mind. 8 Zeichen)</span>

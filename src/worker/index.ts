@@ -10,7 +10,7 @@ type C = Context<{ Bindings: Bindings; Variables: Vars }>;
 
 const app = new Hono<{ Bindings: Bindings; Variables: Vars }>();
 
-const ADMIN_TTL = 60 * 60 * 8;
+const ADMIN_TTL = 60 * 60 * 2;
 const CASHIER_TTL = 60 * 60 * 12;
 const MAX_FAILS = 10;
 const FAIL_WINDOW_S = 600;
@@ -82,7 +82,9 @@ async function recordFail(c: C) {
 // ---------- Middleware ----------
 async function requireAdmin(c: C, next: Next) {
   if (!secret(c)) return bad(c, "SESSION_SECRET ist nicht konfiguriert", 403);
-  const p = await verifyToken(getCookie(c, "admin"), secret(c));
+  // Admin-Token wird nur im Arbeitsspeicher der Seite gehalten (nie als Cookie/Storage gespeichert)
+  const auth = c.req.header("Authorization") ?? "";
+  const p = await verifyToken(auth.startsWith("Bearer ") ? auth.slice(7) : undefined, secret(c));
   if (p?.role !== "admin") return bad(c, "Nicht angemeldet", 401);
   await next();
 }
@@ -349,16 +351,10 @@ app.post("/api/admin/login", async (c) => {
     return bad(c, "Passwort falsch", 401);
   }
   const token = await signToken({ role: "admin", exp: Math.floor(Date.now() / 1000) + ADMIN_TTL }, secret(c));
-  setSession(c, "admin", token, ADMIN_TTL);
-  return c.json({ ok: true });
+  return c.json({ ok: true, token });
 });
 
-app.post("/api/admin/logout", (c) => {
-  deleteCookie(c, "admin", { path: "/" });
-  return c.json({ ok: true });
-});
-
-app.get("/api/admin/me", requireAdmin, (c) => c.json({ ok: true }));
+app.post("/api/admin/logout", (c) => c.json({ ok: true }));
 
 app.post("/api/admin/password", requireAdmin, async (c) => {
   const b = await body<{ current?: string; next?: string }>(c);
