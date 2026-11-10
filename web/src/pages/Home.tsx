@@ -1,5 +1,6 @@
 import { useEffect, useState } from "preact/hooks";
 import { api, errMsg, go } from "../api";
+import { RegisterIcon } from "../ui";
 
 export function Home() {
   const [code, setCode] = useState("");
@@ -34,7 +35,7 @@ export function Home() {
     <main class="hero">
       <div class="card hero-card">
         <div class="logo" aria-hidden="true">
-          🛒
+          <RegisterIcon />
         </div>
         <h1>{title.sv_name}</h1>
         {title.school_name && <p class="muted">{title.school_name}</p>}

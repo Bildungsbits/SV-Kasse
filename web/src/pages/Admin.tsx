@@ -3,21 +3,23 @@ import { parseEuro } from "../../../src/shared/money";
 import { ApiError, api, errMsg, go, setAdminToken } from "../api";
 import { csvLine, download, fmtDate, fmtDateTime, fmtTime, todayIso } from "../format";
 import { rangeReportPdf, shiftReportPdf } from "../pdf";
-import type { Article, Report, Settings, ShiftRow, Stats, StockMovement } from "../types";
+import type { Article, Project, ProjectRow, Report, Settings, ShiftRow, Stats, StockMovement } from "../types";
 import { MoneyField, Modal, Stat, diffLabel, diffTone, euro, toast } from "../ui";
 
-type Tab = "shifts" | "articles" | "stock" | "stats" | "settings";
-const TABS: [Tab, string][] = [
+type Tab = "shifts" | "articles" | "stock" | "stats";
+const PROJECT_TABS: [Tab, string][] = [
   ["shifts", "Schichten"],
   ["articles", "Artikel"],
   ["stock", "Bestand"],
   ["stats", "Auswertung"],
-  ["settings", "Einstellungen"],
 ];
+type PW = { pid: string; readOnly: boolean };
 
 export function Admin() {
   const [authed, setAuthed] = useState(false);
   const [tab, setTab] = useState<Tab>("shifts");
+  const [view, setView] = useState<"projects" | "settings">("projects");
+  const [project, setProject] = useState<Project | null>(null);
 
   // Beim Verlassen des Adminbereichs wird die Anmeldung verworfen
   useEffect(() => () => setAdminToken(null), []);
@@ -27,7 +29,13 @@ export function Admin() {
   function logout() {
     setAdminToken(null);
     setAuthed(false);
+    setProject(null);
   }
+  function open(p: Project) {
+    setTab("shifts");
+    setProject(p);
+  }
+  const readOnly = project?.status === "archived";
 
   return (
     <>
@@ -42,18 +50,43 @@ export function Admin() {
         </button>
       </div>
       <nav class="tabs" aria-label="Bereiche">
-        {TABS.map(([k, label]) => (
-          <button key={k} class={`tab ${tab === k ? "on" : ""}`} onClick={() => setTab(k)}>
-            {label}
-          </button>
-        ))}
+        {project ? (
+          <>
+            <button class="tab" onClick={() => setProject(null)}>
+              ← Projekte
+            </button>
+            {PROJECT_TABS.map(([k, label]) => (
+              <button key={k} class={`tab ${tab === k ? "on" : ""}`} onClick={() => setTab(k)}>
+                {label}
+              </button>
+            ))}
+          </>
+        ) : (
+          <>
+            <button class={`tab ${view === "projects" ? "on" : ""}`} onClick={() => setView("projects")}>
+              Projekte
+            </button>
+            <button class={`tab ${view === "settings" ? "on" : ""}`} onClick={() => setView("settings")}>
+              Einstellungen
+            </button>
+          </>
+        )}
       </nav>
       <div class="page">
-        {tab === "shifts" && <Shifts />}
-        {tab === "articles" && <Articles />}
-        {tab === "stock" && <StockTab />}
-        {tab === "stats" && <StatsTab />}
-        {tab === "settings" && <SettingsTab />}
+        {!project && view === "projects" && <Projects onOpen={open} />}
+        {!project && view === "settings" && <SettingsTab />}
+        {project && (
+          <>
+            <div class="row" style="margin-bottom:.8rem">
+              <b style="font-size:1.1rem">{project.name}</b>
+              {readOnly && <span class="pill warn">archiviert (nur lesbar)</span>}
+            </div>
+            {tab === "shifts" && <Shifts key={project.id} pid={project.id} readOnly={readOnly} />}
+            {tab === "articles" && <Articles key={project.id} pid={project.id} readOnly={readOnly} />}
+            {tab === "stock" && <StockTab key={project.id} pid={project.id} readOnly={readOnly} />}
+            {tab === "stats" && <StatsTab key={project.id} pid={project.id} project={project} />}
+          </>
+        )}
       </div>
     </>
   );
@@ -119,8 +152,263 @@ function Login(props: { onDone: () => void }) {
   );
 }
 
+// ---------- Projekte ----------
+function Projects({ onOpen }: { onOpen: (p: Project) => void }) {
+  const fail = useAuthGuard();
+  const [rows, setRows] = useState<ProjectRow[] | null>(null);
+  const [create, setCreate] = useState(false);
+  const [rename, setRename] = useState<ProjectRow | null>(null);
+  const [del, setDel] = useState<ProjectRow | null>(null);
+
+  const load = () =>
+    api<ProjectRow[]>("/api/admin/projects")
+      .then(setRows)
+      .catch(fail);
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function archive(p: ProjectRow) {
+    if (!confirm(`„${p.name}“ archivieren?\n\nDanach sind keine Verkäufe oder Änderungen mehr möglich. Alle Daten und der PDF-Bericht bleiben erhalten, und du kannst das Projekt jederzeit wieder aktivieren.`)) return;
+    try {
+      await api(`/api/admin/projects/${p.id}/archive`, "POST");
+      toast("Projekt archiviert");
+      load();
+    } catch (e) {
+      fail(e);
+    }
+  }
+  async function unarchive(p: ProjectRow) {
+    try {
+      await api(`/api/admin/projects/${p.id}/unarchive`, "POST");
+      toast("Projekt wieder aktiv");
+      load();
+    } catch (e) {
+      fail(e);
+    }
+  }
+  async function pdf(p: ProjectRow) {
+    try {
+      await rangeReportPdf(await api<Stats>(`/api/admin/stats?project=${p.id}`), "", "");
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  const active = rows?.filter((p) => p.status === "active") ?? [];
+  const archived = rows?.filter((p) => p.status === "archived") ?? [];
+  const card = (p: ProjectRow) => (
+    <div class="card" key={p.id}>
+      <div class="row between">
+        <div>
+          <h3 style="margin:0">{p.name}</h3>
+          <small>
+            angelegt {fmtDate(p.created_at)}
+            {p.archived_at ? `, archiviert ${fmtDate(p.archived_at)}` : ""}
+          </small>
+        </div>
+        <span class={`pill ${p.status === "active" ? "good" : ""}`}>{p.status === "active" ? "aktiv" : "archiviert"}</span>
+      </div>
+      <div class="stats" style="margin:.8rem 0">
+        <Stat label="Verkäufe" value={euro(p.revenue)} />
+        <Stat label="SV-Spenden" value={euro(p.donations)} />
+        <Stat label="Schichten" value={String(p.shift_count)} />
+        <Stat label="Artikel" value={String(p.article_count)} />
+      </div>
+      <div class="row">
+        <button class="btn primary sm" onClick={() => onOpen(p)}>
+          Öffnen
+        </button>
+        <button class="btn sm" onClick={() => pdf(p)}>
+          PDF-Gesamtbericht
+        </button>
+        {p.status === "active" ? (
+          <button class="btn sm" onClick={() => archive(p)}>
+            Archivieren
+          </button>
+        ) : (
+          <button class="btn sm" onClick={() => unarchive(p)}>
+            Wieder aktivieren
+          </button>
+        )}
+        <button class="btn sm" onClick={() => setRename(p)}>
+          Umbenennen
+        </button>
+        <button class="btn sm danger" onClick={() => setDel(p)}>
+          Löschen
+        </button>
+      </div>
+    </div>
+  );
+
+  return (
+    <>
+      <div class="row between" style="margin-bottom:1rem">
+        <div>
+          <h2>Verkaufsprojekte</h2>
+          <small>Pro Aktion ein Projekt (z. B. „Nikolausaktion“) mit eigenen Artikeln, Schichten und Auswertung.</small>
+        </div>
+        <button class="btn primary" onClick={() => setCreate(true)}>
+          + Neues Projekt
+        </button>
+      </div>
+      {!rows ? (
+        <p class="empty">Lade …</p>
+      ) : rows.length === 0 ? (
+        <p class="empty">Noch kein Projekt. Lege das erste an, z. B. „Nikolausaktion“.</p>
+      ) : (
+        <>
+          {active.map(card)}
+          {archived.length > 0 && <h3 style="margin:1.4rem 0 .6rem">Archiv</h3>}
+          {archived.map(card)}
+        </>
+      )}
+
+      {create && (
+        <CreateProject
+          projects={rows ?? []}
+          onClose={() => setCreate(false)}
+          onCreated={() => {
+            setCreate(false);
+            load();
+          }}
+        />
+      )}
+      {rename && (
+        <RenameProject
+          project={rename}
+          onClose={() => setRename(null)}
+          onDone={() => {
+            setRename(null);
+            load();
+          }}
+        />
+      )}
+      {del && (
+        <DeleteProject
+          project={del}
+          onClose={() => setDel(null)}
+          onDone={() => {
+            setDel(null);
+            load();
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+function CreateProject(props: { projects: ProjectRow[]; onClose: () => void; onCreated: () => void }) {
+  const fail = useAuthGuard();
+  const [name, setName] = useState("");
+  const [from, setFrom] = useState("");
+  const [withStock, setWithStock] = useState(false);
+
+  async function submit(e: Event) {
+    e.preventDefault();
+    try {
+      await api("/api/admin/projects", "POST", { name, copy_from: from || undefined, copy_stock: withStock });
+      toast("Projekt angelegt");
+      props.onCreated();
+    } catch (err) {
+      fail(err);
+    }
+  }
+  return (
+    <Modal title="Neues Projekt" onClose={props.onClose}>
+      <form onSubmit={submit}>
+        <label class="field">
+          <span>Name</span>
+          <input type="text" autoFocus placeholder="z. B. Nikolausaktion" maxLength={60} value={name} onInput={(e) => setName((e.target as HTMLInputElement).value)} />
+        </label>
+        {props.projects.length > 0 && (
+          <>
+            <label class="field">
+              <span>Artikel übernehmen aus (optional)</span>
+              <select value={from} onChange={(e) => setFrom((e.target as HTMLSelectElement).value)}>
+                <option value="">Nein, leer starten</option>
+                {props.projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({p.article_count} Artikel)
+                  </option>
+                ))}
+              </select>
+            </label>
+            {from && (
+              <label class="check">
+                <input type="checkbox" checked={withStock} onChange={(e) => setWithStock((e.target as HTMLInputElement).checked)} /> Auch den Bestand übernehmen
+              </label>
+            )}
+          </>
+        )}
+        <button class="btn primary big" disabled={!name.trim()}>
+          Projekt anlegen
+        </button>
+      </form>
+    </Modal>
+  );
+}
+
+function RenameProject(props: { project: ProjectRow; onClose: () => void; onDone: () => void }) {
+  const fail = useAuthGuard();
+  const [name, setName] = useState(props.project.name);
+  async function submit(e: Event) {
+    e.preventDefault();
+    try {
+      await api(`/api/admin/projects/${props.project.id}`, "PUT", { name });
+      props.onDone();
+    } catch (err) {
+      fail(err);
+    }
+  }
+  return (
+    <Modal title="Projekt umbenennen" onClose={props.onClose}>
+      <form onSubmit={submit}>
+        <label class="field">
+          <span>Name</span>
+          <input type="text" autoFocus maxLength={60} value={name} onInput={(e) => setName((e.target as HTMLInputElement).value)} />
+        </label>
+        <button class="btn primary big" disabled={!name.trim()}>
+          Speichern
+        </button>
+      </form>
+    </Modal>
+  );
+}
+
+function DeleteProject(props: { project: ProjectRow; onClose: () => void; onDone: () => void }) {
+  const fail = useAuthGuard();
+  const p = props.project;
+  const [typed, setTyped] = useState("");
+  async function submit() {
+    try {
+      await api(`/api/admin/projects/${p.id}`, "DELETE", { confirm_name: typed });
+      toast("Projekt gelöscht");
+      props.onDone();
+    } catch (err) {
+      fail(err);
+    }
+  }
+  return (
+    <Modal title={`„${p.name}“ endgültig löschen?`} onClose={props.onClose}>
+      <p style="margin-top:0">
+        Gelöscht werden <b>alle Daten</b> dieses Projekts: {p.article_count} Artikel, {p.shift_count} Schichten, alle Verkäufe ({euro(p.revenue)} Umsatz, {euro(p.donations)} Spenden) und der Bestandsverlauf. Das lässt sich <b>nicht rückgängig machen</b>.
+      </p>
+      {p.open_shifts > 0 && <p class="err">Achtung: {p.open_shifts} Schicht(en) sind noch nicht geschlossen. Ein offenes Verkaufsgerät verliert die Kasse.</p>}
+      <p class="muted">Tipp: Lade vorher den PDF-Gesamtbericht herunter.</p>
+      <label class="field">
+        <span>Zur Bestätigung den Projektnamen eingeben</span>
+        <input type="text" autoFocus autoComplete="off" value={typed} placeholder={p.name} onInput={(e) => setTyped((e.target as HTMLInputElement).value)} />
+      </label>
+      <button class="btn danger big" disabled={typed.trim() !== p.name} onClick={submit}>
+        Projekt endgültig löschen
+      </button>
+    </Modal>
+  );
+}
+
 // ---------- Schichten ----------
-function Shifts() {
+function Shifts({ pid, readOnly }: PW) {
   const fail = useAuthGuard();
   const [rows, setRows] = useState<ShiftRow[] | null>(null);
   const [create, setCreate] = useState(false);
@@ -129,7 +417,7 @@ function Shifts() {
   const [detail, setDetail] = useState<string | null>(null);
 
   const load = () =>
-    api<ShiftRow[]>("/api/admin/shifts")
+    api<ShiftRow[]>(`/api/admin/shifts?project=${pid}`)
       .then(setRows)
       .catch(fail);
   useEffect(() => {
@@ -160,9 +448,11 @@ function Shifts() {
           <h2>Kassenschichten</h2>
           <small>Pro Pause eine Schicht anlegen, den Code an die Lehrkraft am Verkaufsgerät geben.</small>
         </div>
-        <button class="btn primary" onClick={() => setCreate(true)}>
-          + Neue Schicht
-        </button>
+        {!readOnly && (
+          <button class="btn primary" onClick={() => setCreate(true)}>
+            + Neue Schicht
+          </button>
+        )}
       </div>
 
       <div class="card">
@@ -208,12 +498,12 @@ function Shifts() {
                       <button class="btn sm" onClick={() => pdf(s.id)}>
                         PDF
                       </button>{" "}
-                      {s.status !== "closed" && (
+                      {!readOnly && s.status !== "closed" && (
                         <button class="btn sm" onClick={() => setCloseFor(s)}>
                           Schließen
                         </button>
                       )}{" "}
-                      {s.sales_count === 0 && (
+                      {!readOnly && s.sales_count === 0 && (
                         <button class="btn sm danger" onClick={() => del(s)} aria-label="Schicht löschen">
                           ✕
                         </button>
@@ -229,6 +519,7 @@ function Shifts() {
 
       {create && (
         <CreateShift
+          pid={pid}
           onClose={() => setCreate(false)}
           onCreated={(name, code) => {
             setCreate(false);
@@ -258,12 +549,12 @@ function Shifts() {
           }}
         />
       )}
-      {detail && <ShiftDetail id={detail} onClose={() => setDetail(null)} onChanged={load} />}
+      {detail && <ShiftDetail id={detail} readOnly={readOnly} onClose={() => setDetail(null)} onChanged={load} />}
     </>
   );
 }
 
-function CreateShift(props: { onClose: () => void; onCreated: (name: string, code: string) => void }) {
+function CreateShift(props: { pid: string; onClose: () => void; onCreated: (name: string, code: string) => void }) {
   const fail = useAuthGuard();
   const [name, setName] = useState("");
   const [start, setStart] = useState("");
@@ -276,7 +567,7 @@ function CreateShift(props: { onClose: () => void; onCreated: (name: string, cod
     if (cents == null) return;
     setBusy(true);
     try {
-      const r = await api<{ code: string }>("/api/admin/shifts", "POST", { name, starting_cents: cents, code: code || undefined });
+      const r = await api<{ code: string }>("/api/admin/shifts", "POST", { project_id: props.pid, name, starting_cents: cents, code: code || undefined });
       props.onCreated(name, r.code);
     } catch (err) {
       fail(err);
@@ -341,7 +632,7 @@ function CloseShift(props: { shift: ShiftRow; onClose: () => void; onDone: () =>
   );
 }
 
-function ShiftDetail(props: { id: string; onClose: () => void; onChanged: () => void }) {
+function ShiftDetail(props: { id: string; readOnly: boolean; onClose: () => void; onChanged: () => void }) {
   const fail = useAuthGuard();
   const [r, setR] = useState<Report | null>(null);
   const [voiding, setVoiding] = useState<string | null>(null);
@@ -418,7 +709,7 @@ function ShiftDetail(props: { id: string; onClose: () => void; onChanged: () => 
                           <span class="pill bad" title={s.void_reason ?? ""}>
                             storniert
                           </span>
-                        ) : (
+                        ) : props.readOnly ? null : (
                           <button class="btn sm danger" onClick={() => setVoiding(s.id)}>
                             Stornieren
                           </button>
@@ -454,12 +745,12 @@ function ShiftDetail(props: { id: string; onClose: () => void; onChanged: () => 
 // ---------- Artikel ----------
 const COLORS = ["#2563eb", "#0f766e", "#16a34a", "#d97706", "#dc2626", "#9333ea", "#db2777", "#475569"];
 
-function Articles() {
+function Articles({ pid, readOnly }: PW) {
   const fail = useAuthGuard();
   const [rows, setRows] = useState<Article[] | null>(null);
   const [edit, setEdit] = useState<Partial<Article> | null>(null);
   const load = () =>
-    api<Article[]>("/api/admin/articles")
+    api<Article[]>(`/api/admin/articles?project=${pid}`)
       .then(setRows)
       .catch(fail);
   useEffect(() => {
@@ -484,9 +775,11 @@ function Articles() {
           <h2>Artikel</h2>
           <small>Festpreise. Bestand wird im Reiter „Bestand“ aufgefüllt.</small>
         </div>
-        <button class="btn primary" onClick={() => setEdit({ color: COLORS[0], emoji: "", stock: 0, active: 1 })}>
-          + Neuer Artikel
-        </button>
+        {!readOnly && (
+          <button class="btn primary" onClick={() => setEdit({ color: COLORS[0], emoji: "", stock: 0, active: 1 })}>
+            + Neuer Artikel
+          </button>
+        )}
       </div>
       <div class="card">
         {!rows ? (
@@ -515,12 +808,16 @@ function Articles() {
                     <td class="num">{a.stock}</td>
                     <td>{a.active ? <span class="pill good">aktiv</span> : <span class="pill">inaktiv</span>}</td>
                     <td class="right nowrap">
-                      <button class="btn sm" onClick={() => setEdit(a)}>
-                        Bearbeiten
-                      </button>{" "}
-                      <button class="btn sm danger" onClick={() => del(a)} aria-label="Entfernen">
-                        ✕
-                      </button>
+                      {!readOnly && (
+                        <>
+                          <button class="btn sm" onClick={() => setEdit(a)}>
+                            Bearbeiten
+                          </button>{" "}
+                          <button class="btn sm danger" onClick={() => del(a)} aria-label="Entfernen">
+                            ✕
+                          </button>
+                        </>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -531,6 +828,7 @@ function Articles() {
       </div>
       {edit && (
         <ArticleForm
+          pid={pid}
           initial={edit}
           onClose={() => setEdit(null)}
           onSaved={() => {
@@ -543,7 +841,7 @@ function Articles() {
   );
 }
 
-function ArticleForm(props: { initial: Partial<Article>; onClose: () => void; onSaved: () => void }) {
+function ArticleForm(props: { pid: string; initial: Partial<Article>; onClose: () => void; onSaved: () => void }) {
   const fail = useAuthGuard();
   const a = props.initial;
   const isNew = !a.id;
@@ -560,7 +858,7 @@ function ArticleForm(props: { initial: Partial<Article>; onClose: () => void; on
   async function submit(e: Event) {
     e.preventDefault();
     if (cents == null) return;
-    const payload = { name, price_cents: cents, emoji, color, sort: Number(sort) || 0, active, stock: Math.max(0, Math.floor(stockN) || 0) };
+    const payload = { project_id: props.pid, name, price_cents: cents, emoji, color, sort: Number(sort) || 0, active, stock: Math.max(0, Math.floor(stockN) || 0) };
     try {
       if (isNew) await api("/api/admin/articles", "POST", payload);
       else await api(`/api/admin/articles/${a.id}`, "PUT", payload);
@@ -618,7 +916,7 @@ function ArticleForm(props: { initial: Partial<Article>; onClose: () => void; on
 }
 
 // ---------- Bestand ----------
-function StockTab() {
+function StockTab({ pid, readOnly }: PW) {
   const fail = useAuthGuard();
   const [rows, setRows] = useState<Article[] | null>(null);
   const [moves, setMoves] = useState<StockMovement[]>([]);
@@ -626,8 +924,8 @@ function StockTab() {
   const [adj, setAdj] = useState<Article | null>(null);
 
   const load = () => {
-    api<Article[]>("/api/admin/articles").then(setRows).catch(fail);
-    api<StockMovement[]>("/api/admin/stock-movements").then(setMoves).catch(fail);
+    api<Article[]>(`/api/admin/articles?project=${pid}`).then(setRows).catch(fail);
+    api<StockMovement[]>(`/api/admin/stock-movements?project=${pid}`).then(setMoves).catch(fail);
   };
   useEffect(() => {
     load();
@@ -664,9 +962,11 @@ function StockTab() {
                         <span class={`pill ${a.stock === 0 ? "bad" : a.stock <= low ? "warn" : "good"}`}>{a.stock}</span>
                       </td>
                       <td class="right">
-                        <button class="btn sm" onClick={() => setAdj(a)}>
-                          Bestand ändern
-                        </button>
+                        {!readOnly && (
+                          <button class="btn sm" onClick={() => setAdj(a)}>
+                            Bestand ändern
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -765,7 +1065,7 @@ function AdjustStock(props: { article: Article; onClose: () => void; onDone: () 
 }
 
 // ---------- Auswertung ----------
-function StatsTab() {
+function StatsTab({ pid, project }: { pid: string; project: Project }) {
   const fail = useAuthGuard();
   const [from, setFrom] = useState("");
   const [to, setTo] = useState(todayIso());
@@ -775,6 +1075,7 @@ function StatsTab() {
     const q = new URLSearchParams();
     if (from) q.set("from", from);
     if (to) q.set("to", to);
+    q.set("project", pid);
     api<Stats>(`/api/admin/stats?${q}`)
       .then(setSt)
       .catch(fail);
@@ -787,7 +1088,7 @@ function StatsTab() {
     for (const s of st.shifts) out.push(csvLine([s.name, fmtDate(s.created_at), s.status, s.starting_cents / 100, s.revenue / 100, s.donations / 100, s.counted_cents == null ? "" : s.counted_cents / 100]));
     out.push("", csvLine(["Artikel", "Menge", "Umsatz"]));
     for (const a of st.byArticle) out.push(csvLine([a.name, a.qty, a.revenue / 100]));
-    download(`SV-Kasse_${from || "alle"}_${to || "heute"}.csv`, out.join("\n"));
+    download(`SV-Kasse_${project.name.replace(/[^a-zA-Z0-9äöüÄÖÜß_-]+/g, "_")}_${from || "alle"}_${to || "heute"}.csv`, out.join("\n"));
   }
 
   return (

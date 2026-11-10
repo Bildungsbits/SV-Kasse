@@ -109,6 +109,7 @@ interface ShiftRow {
   closed_at: string | null;
   counted_cents: number | null;
   note: string;
+  project_id: string | null;
 }
 
 async function shiftTotals(db: D1Database, shift: ShiftRow) {
@@ -173,7 +174,10 @@ async function buildReport(db: D1Database, shiftId: string) {
     .all();
   const sales = await salesWithItems(db, shiftId);
   const settings = await publicSettings(db);
-  return { shift, totals, items: items.results, sales: [...sales].reverse(), settings };
+  const project = shift.project_id
+    ? await db.prepare("SELECT id, name, status FROM projects WHERE id = ?").bind(shift.project_id).first<{ id: string; name: string; status: string }>()
+    : null;
+  return { shift, project, totals, items: items.results, sales: [...sales].reverse(), settings };
 }
 
 async function voidSale(db: D1Database, saleId: string, reason: string, shiftId?: string) {
@@ -183,6 +187,11 @@ async function voidSale(db: D1Database, saleId: string, reason: string, shiftId?
     .first<{ id: string; shift_id: string; voided_at: string | null }>();
   if (!sale || (shiftId && sale.shift_id !== shiftId)) return { ok: false as const, error: "Verkauf nicht gefunden", status: 404 as const };
   if (sale.voided_at) return { ok: false as const, error: "Bereits storniert", status: 409 as const };
+  const ps = await db
+    .prepare("SELECT p.status FROM sales s JOIN shifts sh ON sh.id = s.shift_id LEFT JOIN projects p ON p.id = sh.project_id WHERE s.id = ?")
+    .bind(saleId)
+    .first<{ status: string | null }>();
+  if (ps?.status === "archived") return { ok: false as const, error: "Projekt ist archiviert (schreibgeschützt)", status: 409 as const };
   const items = await db
     .prepare("SELECT article_id, qty FROM sale_items WHERE sale_id = ?")
     .bind(saleId)
@@ -198,6 +207,27 @@ async function voidSale(db: D1Database, saleId: string, reason: string, shiftId?
   ];
   await db.batch(stmts);
   return { ok: true as const };
+}
+
+// ---------- Projekte ----------
+async function projectStatus(db: D1Database, projectId: string | null | undefined): Promise<"active" | "archived" | null> {
+  if (!projectId) return null;
+  const r = await db.prepare("SELECT status FROM projects WHERE id = ?").bind(projectId).first<{ status: "active" | "archived" }>();
+  return r?.status ?? null;
+}
+
+/** Antwort mit Fehler, wenn das Projekt fehlt oder archiviert (schreibgeschützt) ist, sonst null */
+async function guardActiveProject(c: C, projectId: string | null | undefined) {
+  const st = await projectStatus(c.env.DB, projectId);
+  if (!st) return bad(c, "Projekt nicht gefunden", 404);
+  if (st === "archived") return bad(c, "Projekt ist archiviert (schreibgeschützt)", 409);
+  return null;
+}
+
+async function guardArticle(c: C, articleId: string) {
+  const a = await c.env.DB.prepare("SELECT project_id FROM articles WHERE id = ?").bind(articleId).first<{ project_id: string | null }>();
+  if (!a) return bad(c, "Artikel nicht gefunden", 404);
+  return guardActiveProject(c, a.project_id);
 }
 
 // ---------- Öffentlich ----------
@@ -240,9 +270,12 @@ app.get("/api/cashier/state", requireCashier, async (c) => {
   if (!shift) return bad(c, "Schicht nicht gefunden", 404);
   const { code: _code, ...safeShift } = shift;
   const articles = await db
-    .prepare("SELECT id, name, price_cents, stock, emoji, color FROM articles WHERE active = 1 ORDER BY sort, name")
+    .prepare("SELECT id, name, price_cents, stock, emoji, color FROM articles WHERE active = 1 AND project_id = ? ORDER BY sort, name")
+    .bind(shift.project_id)
     .all();
+  const project = shift.project_id ? await db.prepare("SELECT id, name FROM projects WHERE id = ?").bind(shift.project_id).first() : null;
   return c.json({
+    project,
     shift: safeShift,
     totals: await shiftTotals(db, shift),
     articles: articles.results,
@@ -253,7 +286,7 @@ app.get("/api/cashier/state", requireCashier, async (c) => {
 
 app.post("/api/cashier/sales", requireCashier, async (c) => {
   const db = c.env.DB;
-  const shift = await db.prepare("SELECT status FROM shifts WHERE id = ?").bind(c.get("shiftId")).first<{ status: string }>();
+  const shift = await db.prepare("SELECT status, project_id FROM shifts WHERE id = ?").bind(c.get("shiftId")).first<{ status: string; project_id: string | null }>();
   if (shift?.status !== "open") return bad(c, "Die Kasse ist geschlossen", 409);
 
   const b = await body<{ items?: { article_id: string; qty: number }[]; paid?: number; donation?: number }>(c);
@@ -266,10 +299,11 @@ app.post("/api/cashier/sales", requireCashier, async (c) => {
   }
   const ids = [...qtyById.keys()];
   const rows = await db
-    .prepare(`SELECT id, name, price_cents, stock, active FROM articles WHERE id IN (${ids.map(() => "?").join(",")})`)
+    .prepare(`SELECT id, name, price_cents, stock, active, project_id FROM articles WHERE id IN (${ids.map(() => "?").join(",")})`)
     .bind(...ids)
-    .all<{ id: string; name: string; price_cents: number; stock: number; active: number }>();
+    .all<{ id: string; name: string; price_cents: number; stock: number; active: number; project_id: string | null }>();
   if (rows.results.length !== ids.length) return bad(c, "Artikel nicht gefunden");
+  if (rows.results.some((a) => a.project_id !== shift.project_id)) return bad(c, "Artikel gehört nicht zu diesem Projekt", 409);
 
   let total = 0;
   for (const a of rows.results) {
@@ -389,9 +423,98 @@ app.put("/api/admin/settings", requireAdmin, async (c) => {
   return c.json(await publicSettings(c.env.DB));
 });
 
+// Projekte
+app.get("/api/admin/projects", requireAdmin, async (c) => {
+  const r = await c.env.DB.prepare(
+    `SELECT p.*,
+       (SELECT COUNT(*) FROM articles WHERE project_id = p.id) AS article_count,
+       (SELECT COUNT(*) FROM shifts WHERE project_id = p.id) AS shift_count,
+       (SELECT COUNT(*) FROM shifts WHERE project_id = p.id AND status != 'closed') AS open_shifts,
+       (SELECT COALESCE(SUM(s.total_cents),0) FROM sales s JOIN shifts sh ON sh.id = s.shift_id WHERE sh.project_id = p.id AND s.voided_at IS NULL) AS revenue,
+       (SELECT COALESCE(SUM(s.donation_cents),0) FROM sales s JOIN shifts sh ON sh.id = s.shift_id WHERE sh.project_id = p.id AND s.voided_at IS NULL) AS donations
+     FROM projects p ORDER BY (p.status = 'archived'), p.created_at DESC, p.rowid DESC`,
+  ).all();
+  return c.json(r.results);
+});
+
+app.post("/api/admin/projects", requireAdmin, async (c) => {
+  const b = await body<{ name?: string; copy_from?: string; copy_stock?: boolean }>(c);
+  const name = (b?.name ?? "").trim().slice(0, 60);
+  if (!name) return bad(c, "Bitte einen Projektnamen angeben (z. B. „Nikolaus-Aktion“)");
+  const db = c.env.DB;
+  const id = crypto.randomUUID();
+  const stmts = [db.prepare("INSERT INTO projects (id, name, created_at) VALUES (?, ?, ?)").bind(id, name, nowIso())];
+  if (b?.copy_from) {
+    if (!(await projectStatus(db, b.copy_from))) return bad(c, "Quellprojekt nicht gefunden", 404);
+    const withStock = b.copy_stock ? 1 : 0;
+    stmts.push(
+      db
+        .prepare(
+          `INSERT INTO articles (id, name, price_cents, stock, emoji, color, active, sort, project_id)
+           SELECT lower(hex(randomblob(16))), name, price_cents, CASE WHEN ?1 = 1 THEN stock ELSE 0 END, emoji, color, active, sort, ?2
+           FROM articles WHERE project_id = ?3`,
+        )
+        .bind(withStock, id, b.copy_from),
+    );
+    if (withStock)
+      stmts.push(
+        db
+          .prepare("INSERT INTO stock_movements (article_id, delta, reason, note) SELECT id, stock, 'restock', 'Aus Projekt übernommen' FROM articles WHERE project_id = ? AND stock > 0")
+          .bind(id),
+      );
+  }
+  await db.batch(stmts);
+  return c.json({ ok: true, id });
+});
+
+app.put("/api/admin/projects/:id", requireAdmin, async (c) => {
+  const b = await body<{ name?: string }>(c);
+  const name = (b?.name ?? "").trim().slice(0, 60);
+  if (!name) return bad(c, "Bitte einen Namen angeben");
+  const r = await c.env.DB.prepare("UPDATE projects SET name = ? WHERE id = ?").bind(name, pid(c)).run();
+  return r.meta.changes ? c.json({ ok: true }) : bad(c, "Projekt nicht gefunden", 404);
+});
+
+app.post("/api/admin/projects/:id/archive", requireAdmin, async (c) => {
+  const id = pid(c);
+  const st = await projectStatus(c.env.DB, id);
+  if (!st) return bad(c, "Projekt nicht gefunden", 404);
+  const open = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM shifts WHERE project_id = ? AND status != 'closed'").bind(id).first<{ n: number }>();
+  if ((open?.n ?? 0) > 0) return bad(c, "Es gibt noch nicht geschlossene Schichten. Bitte zuerst alle Kassen abschließen.", 409);
+  await c.env.DB.prepare("UPDATE projects SET status = 'archived', archived_at = ? WHERE id = ?").bind(nowIso(), id).run();
+  return c.json({ ok: true });
+});
+
+app.post("/api/admin/projects/:id/unarchive", requireAdmin, async (c) => {
+  const r = await c.env.DB.prepare("UPDATE projects SET status = 'active', archived_at = NULL WHERE id = ?").bind(pid(c)).run();
+  return r.meta.changes ? c.json({ ok: true }) : bad(c, "Projekt nicht gefunden", 404);
+});
+
+// Löscht das Projekt samt aller Artikel, Schichten, Verkäufe und Bestandsbewegungen (nicht rückgängig zu machen)
+app.delete("/api/admin/projects/:id", requireAdmin, async (c) => {
+  const id = pid(c);
+  const b = await body<{ confirm_name?: string }>(c);
+  const p = await c.env.DB.prepare("SELECT name FROM projects WHERE id = ?").bind(id).first<{ name: string }>();
+  if (!p) return bad(c, "Projekt nicht gefunden", 404);
+  if ((b?.confirm_name ?? "").trim() !== p.name) return bad(c, "Zur Bestätigung den Projektnamen genau eingeben", 400);
+  const db = c.env.DB;
+  const salesOf = "SELECT s.id FROM sales s JOIN shifts sh ON sh.id = s.shift_id WHERE sh.project_id = ?1";
+  await db.batch([
+    db.prepare(`DELETE FROM stock_movements WHERE article_id IN (SELECT id FROM articles WHERE project_id = ?1) OR sale_id IN (${salesOf})`).bind(id),
+    db.prepare(`DELETE FROM sale_items WHERE sale_id IN (${salesOf})`).bind(id),
+    db.prepare("DELETE FROM sales WHERE shift_id IN (SELECT id FROM shifts WHERE project_id = ?1)").bind(id),
+    db.prepare("DELETE FROM shifts WHERE project_id = ?1").bind(id),
+    db.prepare("DELETE FROM articles WHERE project_id = ?1").bind(id),
+    db.prepare("DELETE FROM projects WHERE id = ?1").bind(id),
+  ]);
+  return c.json({ ok: true });
+});
+
 // Artikel
 app.get("/api/admin/articles", requireAdmin, async (c) => {
-  const r = await c.env.DB.prepare("SELECT * FROM articles ORDER BY active DESC, sort, name").all();
+  const r = await c.env.DB.prepare("SELECT * FROM articles WHERE project_id = ? ORDER BY active DESC, sort, name")
+    .bind(c.req.query("project") ?? "")
+    .all();
   return c.json(r.results);
 });
 
@@ -410,11 +533,14 @@ app.post("/api/admin/articles", requireAdmin, async (c) => {
   const b = await body<Record<string, unknown>>(c);
   const a = parseArticle(b);
   if ("error" in a) return bad(c, String(a.error));
+  const projectId = typeof b?.project_id === "string" ? b.project_id : "";
+  const denied = await guardActiveProject(c, projectId);
+  if (denied) return denied;
   const stock = isInt(b?.stock) && (b!.stock as number) >= 0 ? (b!.stock as number) : 0;
   const id = crypto.randomUUID();
   const stmts = [
-    c.env.DB.prepare("INSERT INTO articles (id, name, price_cents, stock, emoji, color, active, sort) VALUES (?,?,?,?,?,?,?,?)").bind(
-      id, a.name, a.price_cents, stock, a.emoji, a.color, a.active, a.sort,
+    c.env.DB.prepare("INSERT INTO articles (id, name, price_cents, stock, emoji, color, active, sort, project_id) VALUES (?,?,?,?,?,?,?,?,?)").bind(
+      id, a.name, a.price_cents, stock, a.emoji, a.color, a.active, a.sort, projectId,
     ),
   ];
   if (stock > 0)
@@ -424,6 +550,8 @@ app.post("/api/admin/articles", requireAdmin, async (c) => {
 });
 
 app.put("/api/admin/articles/:id", requireAdmin, async (c) => {
+  const denied = await guardArticle(c, pid(c));
+  if (denied) return denied;
   const a = parseArticle(await body<Record<string, unknown>>(c));
   if ("error" in a) return bad(c, String(a.error));
   const r = await c.env.DB.prepare("UPDATE articles SET name=?, price_cents=?, emoji=?, color=?, sort=?, active=? WHERE id=?")
@@ -434,6 +562,8 @@ app.put("/api/admin/articles/:id", requireAdmin, async (c) => {
 
 app.delete("/api/admin/articles/:id", requireAdmin, async (c) => {
   const id = pid(c);
+  const denied = await guardArticle(c, id);
+  if (denied) return denied;
   const used = await c.env.DB.prepare("SELECT 1 FROM sale_items WHERE article_id = ? LIMIT 1").bind(id).first();
   if (used) {
     await c.env.DB.prepare("UPDATE articles SET active = 0 WHERE id = ?").bind(id).run();
@@ -451,6 +581,8 @@ app.post("/api/admin/articles/:id/stock", requireAdmin, async (c) => {
   if (!b || !isInt(b.delta) || b.delta === 0 || Math.abs(b.delta) > 100000) return bad(c, "Ungültige Menge");
   const reason = b.reason === "correction" ? "correction" : "restock";
   const id = pid(c);
+  const denied = await guardArticle(c, id);
+  if (denied) return denied;
   const a = await c.env.DB.prepare("SELECT stock FROM articles WHERE id = ?").bind(id).first<{ stock: number }>();
   if (!a) return bad(c, "Artikel nicht gefunden", 404);
   if (a.stock + b.delta < 0) return bad(c, "Bestand kann nicht negativ werden");
@@ -463,9 +595,11 @@ app.post("/api/admin/articles/:id/stock", requireAdmin, async (c) => {
 
 app.get("/api/admin/stock-movements", requireAdmin, async (c) => {
   const r = await c.env.DB.prepare(
-    `SELECT m.*, a.name AS article_name FROM stock_movements m LEFT JOIN articles a ON a.id = m.article_id
-     ORDER BY m.id DESC LIMIT 200`,
-  ).all();
+    `SELECT m.*, a.name AS article_name FROM stock_movements m JOIN articles a ON a.id = m.article_id
+     WHERE a.project_id = ? ORDER BY m.id DESC LIMIT 200`,
+  )
+    .bind(c.req.query("project") ?? "")
+    .all();
   return c.json(r.results);
 });
 
@@ -476,8 +610,10 @@ app.get("/api/admin/shifts", requireAdmin, async (c) => {
        (SELECT COALESCE(SUM(total_cents),0) FROM sales WHERE shift_id = s.id AND voided_at IS NULL) AS revenue,
        (SELECT COALESCE(SUM(donation_cents),0) FROM sales WHERE shift_id = s.id AND voided_at IS NULL) AS donations,
        (SELECT COUNT(*) FROM sales WHERE shift_id = s.id AND voided_at IS NULL) AS sales_count
-     FROM shifts s ORDER BY s.created_at DESC, s.rowid DESC LIMIT 200`,
-  ).all<ShiftRow & { revenue: number; donations: number }>();
+     FROM shifts s WHERE s.project_id = ? ORDER BY s.created_at DESC, s.rowid DESC LIMIT 200`,
+  )
+    .bind(c.req.query("project") ?? "")
+    .all<ShiftRow & { revenue: number; donations: number }>();
   return c.json(
     r.results.map((s) => {
       const expected = s.starting_cents + s.revenue + s.donations;
@@ -487,7 +623,9 @@ app.get("/api/admin/shifts", requireAdmin, async (c) => {
 });
 
 app.post("/api/admin/shifts", requireAdmin, async (c) => {
-  const b = await body<{ name?: string; starting_cents?: number; code?: string }>(c);
+  const b = await body<{ name?: string; starting_cents?: number; code?: string; project_id?: string }>(c);
+  const denied = await guardActiveProject(c, b?.project_id);
+  if (denied) return denied;
   const name = (b?.name ?? "").trim().slice(0, 60);
   if (!name) return bad(c, "Bitte einen Namen angeben (z. B. „1. große Pause“)");
   if (!isInt(b?.starting_cents) || (b!.starting_cents as number) < 0 || (b!.starting_cents as number) > 1_000_000) return bad(c, "Ungültiger Startbetrag");
@@ -508,8 +646,8 @@ app.post("/api/admin/shifts", requireAdmin, async (c) => {
   if (!code) return bad(c, "Konnte keinen freien Code erzeugen", 409);
 
   const id = crypto.randomUUID();
-  await c.env.DB.prepare("INSERT INTO shifts (id, name, code, starting_cents, created_at) VALUES (?,?,?,?,?)")
-    .bind(id, name, code, b!.starting_cents, nowIso())
+  await c.env.DB.prepare("INSERT INTO shifts (id, name, code, starting_cents, created_at, project_id) VALUES (?,?,?,?,?,?)")
+    .bind(id, name, code, b!.starting_cents, nowIso(), b!.project_id)
     .run();
   return c.json({ ok: true, id, code });
 });
@@ -554,39 +692,44 @@ app.get("/api/admin/stats", requireAdmin, async (c) => {
   if (!re.test(from) && from !== "0000-01-01") return bad(c, "Ungültiges Datum (von)");
   if (!re.test(to) && to !== "9999-12-31") return bad(c, "Ungültiges Datum (bis)");
   const db = c.env.DB;
+  const proj = c.req.query("project") ?? "";
   const range = [from, to + " 23:59:59"];
+  const pf = [proj, proj]; // (? = '' OR sh.project_id = ?)
   const totals = await db
     .prepare(
       `SELECT COUNT(*) AS sales_count, COALESCE(SUM(total_cents),0) AS revenue, COALESCE(SUM(donation_cents),0) AS donations
-       FROM sales WHERE voided_at IS NULL AND created_at >= ? AND created_at <= ?`,
+       FROM sales s JOIN shifts sh ON sh.id = s.shift_id
+       WHERE s.voided_at IS NULL AND s.created_at >= ? AND s.created_at <= ? AND (? = '' OR sh.project_id = ?)`,
     )
-    .bind(...range)
+    .bind(...range, ...pf)
     .first();
   const byDay = await db
     .prepare(
-      `SELECT substr(created_at,1,10) AS day, COUNT(*) AS sales_count, SUM(total_cents) AS revenue, SUM(donation_cents) AS donations
-       FROM sales WHERE voided_at IS NULL AND created_at >= ? AND created_at <= ? GROUP BY day ORDER BY day`,
+      `SELECT substr(s.created_at,1,10) AS day, COUNT(*) AS sales_count, SUM(s.total_cents) AS revenue, SUM(s.donation_cents) AS donations
+       FROM sales s JOIN shifts sh ON sh.id = s.shift_id
+       WHERE s.voided_at IS NULL AND s.created_at >= ? AND s.created_at <= ? AND (? = '' OR sh.project_id = ?) GROUP BY day ORDER BY day`,
     )
-    .bind(...range)
+    .bind(...range, ...pf)
     .all();
   const byArticle = await db
     .prepare(
       `SELECT si.name, SUM(si.qty) AS qty, SUM(si.qty * si.unit_price_cents) AS revenue
-       FROM sale_items si JOIN sales s ON s.id = si.sale_id
-       WHERE s.voided_at IS NULL AND s.created_at >= ? AND s.created_at <= ? GROUP BY si.name ORDER BY qty DESC`,
+       FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN shifts sh ON sh.id = s.shift_id
+       WHERE s.voided_at IS NULL AND s.created_at >= ? AND s.created_at <= ? AND (? = '' OR sh.project_id = ?) GROUP BY si.name ORDER BY qty DESC`,
     )
-    .bind(...range)
+    .bind(...range, ...pf)
     .all();
   const shifts = await db
     .prepare(
       `SELECT s.id, s.name, s.created_at, s.status, s.starting_cents, s.counted_cents,
          (SELECT COALESCE(SUM(total_cents),0) FROM sales WHERE shift_id = s.id AND voided_at IS NULL) AS revenue,
          (SELECT COALESCE(SUM(donation_cents),0) FROM sales WHERE shift_id = s.id AND voided_at IS NULL) AS donations
-       FROM shifts s WHERE s.created_at >= ? AND s.created_at <= ? ORDER BY s.created_at`,
+       FROM shifts s WHERE s.created_at >= ? AND s.created_at <= ? AND (? = '' OR s.project_id = ?) ORDER BY s.created_at`,
     )
-    .bind(...range)
+    .bind(...range, ...pf)
     .all();
-  return c.json({ totals, byDay: byDay.results, byArticle: byArticle.results, shifts: shifts.results, settings: await publicSettings(db) });
+  const project = proj ? await db.prepare("SELECT id, name, status FROM projects WHERE id = ?").bind(proj).first() : null;
+  return c.json({ project, totals, byDay: byDay.results, byArticle: byArticle.results, shifts: shifts.results, settings: await publicSettings(db) });
 });
 
 app.notFound((c) => (c.req.path.startsWith("/api/") ? c.json({ error: "Nicht gefunden" }, 404) : c.text("Not found", 404)));

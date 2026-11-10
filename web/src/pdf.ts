@@ -46,6 +46,7 @@ export async function shiftReportPdf(r: Report) {
     styles: { fontSize: 10, cellPadding: 1.2 },
     columnStyles: { 0: { fontStyle: "bold", cellWidth: 45 } },
     body: [
+      ["Projekt", r.project?.name ?? "–"],
       ["Datum", fmtDate(s.opened_at ?? s.created_at)],
       ["Geöffnet", s.opened_at ? fmtDateTime(s.opened_at) : "–"],
       ["Geschlossen", s.closed_at ? fmtDateTime(s.closed_at) : "noch offen"],
@@ -128,7 +129,7 @@ export async function shiftReportPdf(r: Report) {
 
 /** PDF-Gesamtbericht für einen Zeitraum */
 export async function rangeReportPdf(st: Stats, from: string, to: string) {
-  const { doc, autoTable } = await newDoc("Gesamtbericht SV-Kasse", st.settings);
+  const { doc, autoTable } = await newDoc(st.project ? `Gesamtbericht: ${st.project.name}` : "Gesamtbericht SV-Kasse", st.settings);
   const label = from || to ? `Zeitraum: ${from || "Beginn"} bis ${to || "heute"}` : "Zeitraum: gesamt";
   doc.setFontSize(10);
   doc.text(label, 14, 33);
@@ -164,5 +165,5 @@ export async function rangeReportPdf(st: Stats, from: string, to: string) {
     body: st.byArticle.map((a) => [a.name, String(a.qty), formatEuro(a.revenue)]),
   });
   footer(doc);
-  doc.save(`Gesamtbericht_${from || "alle"}_${to || "heute"}.pdf`);
+  doc.save(`Gesamtbericht_${fileSafe(st.project?.name ?? "alle-Projekte")}_${from || "alle"}_${to || "heute"}.pdf`);
 }

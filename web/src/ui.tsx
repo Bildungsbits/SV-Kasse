@@ -97,6 +97,27 @@ export function MoneyField(props: {
 
 export const euro = formatEuro;
 
+/** Logo: Registrierkasse (Farben folgen dem Theme) */
+export function RegisterIcon(props: { size?: number }) {
+  return (
+    <svg width={props.size ?? 46} height={props.size ?? 46} viewBox="0 0 64 64" aria-hidden="true">
+      <rect x="19" y="8" width="26" height="12" rx="3" fill="var(--brand-ink)" />
+      <rect x="23" y="12" width="18" height="4" rx="1.5" fill="var(--brand)" />
+      <path d="M15 23h34l6 17H9z" fill="var(--brand-ink)" />
+      <g fill="var(--brand)">
+        <rect x="19" y="27" width="6" height="3.5" rx="1" />
+        <rect x="29" y="27" width="6" height="3.5" rx="1" />
+        <rect x="39" y="27" width="6" height="3.5" rx="1" />
+        <rect x="17.5" y="33" width="6" height="3.5" rx="1" />
+        <rect x="29" y="33" width="6" height="3.5" rx="1" />
+        <rect x="40.5" y="33" width="6" height="3.5" rx="1" />
+      </g>
+      <rect x="8" y="42" width="48" height="12" rx="3.5" fill="var(--brand-ink)" />
+      <rect x="25" y="46.5" width="14" height="3" rx="1.5" fill="var(--brand)" />
+    </svg>
+  );
+}
+
 export function Stat(props: { label: string; value: string; tone?: "good" | "warn" | "bad" }) {
   return (
     <div class={`stat ${props.tone ?? ""}`}>

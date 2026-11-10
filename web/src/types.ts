@@ -1,3 +1,19 @@
+export interface Project {
+  id: string;
+  name: string;
+  status: "active" | "archived";
+  created_at: string;
+  archived_at: string | null;
+}
+
+export interface ProjectRow extends Project {
+  article_count: number;
+  shift_count: number;
+  open_shifts: number;
+  revenue: number;
+  donations: number;
+}
+
 export interface Settings {
   school_name: string;
   sv_name: string;
@@ -59,6 +75,7 @@ export interface Totals {
 }
 
 export interface CashierState {
+  project: { id: string; name: string } | null;
   shift: Shift;
   totals: Totals;
   articles: Article[];
@@ -67,6 +84,7 @@ export interface CashierState {
 }
 
 export interface Report {
+  project: { id: string; name: string; status: string } | null;
   shift: Shift;
   totals: Totals;
   items: { article_id: string; name: string; unit_price_cents: number; qty: number; revenue: number }[];
@@ -83,6 +101,7 @@ export interface ShiftRow extends Shift {
 }
 
 export interface Stats {
+  project: { id: string; name: string; status: string } | null;
   totals: { sales_count: number; revenue: number; donations: number };
   byDay: { day: string; sales_count: number; revenue: number; donations: number }[];
   byArticle: { name: string; qty: number; revenue: number }[];

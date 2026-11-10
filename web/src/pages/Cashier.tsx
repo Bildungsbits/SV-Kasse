@@ -74,7 +74,7 @@ export function Cashier() {
     <>
       <div class="topbar">
         <h1>
-          {settings.sv_name} · {shift.name}
+          {state.project?.name ?? settings.sv_name} · {shift.name}
         </h1>
         <span class="sp" />
         <button class="btn sm" onClick={() => setHistory(true)}>
