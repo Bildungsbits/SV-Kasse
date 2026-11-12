@@ -725,3 +725,23 @@ input[type="color"] {
     display: none !important;
   }
 }
+
+/* Verbindungsstatus der Kasse */
+.netbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem max(16px, env(safe-area-inset-left));
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-weight: 600;
+  border-bottom: 1px solid var(--line);
+}
+.netbar.bad {
+  background: var(--bad-bg);
+  color: var(--bad);
+}
+.netbar .sp {
+  flex: 1;
+}

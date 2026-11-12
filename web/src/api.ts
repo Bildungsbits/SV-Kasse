@@ -14,7 +14,7 @@ export const setAdminToken = (t: string | null) => {
   adminToken = t;
 };
 
-export async function api<T = unknown>(path: string, method = "GET", body?: unknown): Promise<T> {
+export async function api<T = unknown>(path: string, method = "GET", body?: unknown, timeoutMs = 15000): Promise<T> {
   let res: Response;
   try {
     const headers: Record<string, string> = {};
@@ -25,6 +25,8 @@ export async function api<T = unknown>(path: string, method = "GET", body?: unkn
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
       credentials: "same-origin",
+      // Hängt die Verbindung (schlechtes WLAN), soll die Kasse nicht ewig warten
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch {
     throw new ApiError("Keine Verbindung zum Server. Bitte Internet prüfen.", 0);

@@ -10,6 +10,16 @@ Kassensystem für die Schülervertretung. Läuft auf Cloudflare (Worker + D1-Dat
 4. Fehler? *Verkäufe* → *Stornieren* (mit Grund; der Bestand wird zurückgebucht).
 5. Pausenende: *Kasse abschließen* → Bargeld zählen → die Differenz zum Soll wird angezeigt → **PDF-Kassenbericht** herunterladen. Danach ist der Code ungültig.
 
+### Wenn das Internet ausfällt
+
+Die Kasse arbeitet weiter. Oben erscheint „Offline“, Verkäufe werden auf dem Gerät gespeichert und gehen automatisch an den Server, sobald wieder Verbindung besteht („Jetzt senden“ geht auch von Hand). Wichtig:
+
+- Das Gerät muss die Kasse **einmal mit Internet geöffnet** haben (am besten auf den Home-Bildschirm legen). Dann startet sie auch ohne Netz.
+- **Stornieren** und **Kasse abschließen** gehen nur mit Verbindung. Der Abschluss ist gesperrt, bis alle wartenden Verkäufe übertragen sind.
+- Verkäufe, die der Server ablehnt (z. B. weil die Kasse inzwischen geschlossen wurde), bleiben rot markiert unter „Ansehen“ sichtbar. Das Geld dafür ist in der Kasse: der Aufsicht melden.
+- Ware, die offline mehrfach verkauft wurde, kann den Bestand auf 0 setzen. Der Verkauf wird trotzdem gebucht.
+- Nicht „Gerät abmelden“ drücken, solange Verkäufe warten.
+
 Artikel, Preise und Bestand pflegt ihr im Admin unter *Artikel* und *Bestand*. Auswertungen (Tage, Artikel, Zeitraum) mit PDF- und CSV-Export gibt es unter *Auswertung*.
 
 ## Einmalige Einrichtung auf Cloudflare
@@ -54,7 +64,7 @@ Nach Code-Änderungen am Frontend: `npm run build` erneut ausführen. Alternativ
 
 ## Nach einem Neuaufsetzen des Macs
 
-Node.js (nodejs.org) und `sudo npm install -g wrangler` installieren, im Projektordner `npm install` ausführen. Daten liegen in Cloudflare und gehen nicht verloren.
+Node.js (nodejs.org) und `npm install -g wrangler` installieren, im Projektordner `npm install` ausführen. Daten liegen in Cloudflare und gehen nicht verloren.
 
 ## Hinweise
 

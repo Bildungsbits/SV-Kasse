@@ -1,5 +1,6 @@
 import { useEffect, useState } from "preact/hooks";
-import { api, errMsg, go } from "../api";
+import { ApiError, api, errMsg, go } from "../api";
+import { hasCachedState } from "../offlineStore";
 import { RegisterIcon } from "../ui";
 
 export function Home() {
@@ -11,9 +12,12 @@ export function Home() {
   useEffect(() => {
     api<{ sv_name: string; school_name: string }>("/api/public/settings").then(setTitle).catch(() => {});
     // Läuft bereits eine Sitzung auf diesem Gerät? Dann direkt weiter.
-    api("/api/cashier/state")
+    api("/api/cashier/state", "GET", undefined, 5000)
       .then(() => go("/kasse"))
-      .catch(() => {});
+      .catch((e) => {
+        // Kein Netz, aber die Kasse lief auf diesem Gerät schon: offline weiterarbeiten
+        if (e instanceof ApiError && e.status === 0 && hasCachedState()) go("/kasse");
+      });
   }, []);
 
   async function submit(e: Event) {

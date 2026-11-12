@@ -27,3 +27,10 @@ function App() {
 }
 
 render(<App />, document.getElementById("app")!);
+
+// Service Worker: lässt die App auch ohne Internet starten (nur in der fertigen Version, nicht im Entwicklungsmodus)
+if ("serviceWorker" in navigator && import.meta.env.PROD) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register(`/sw.js?b=${__BUILD_ID__}`).catch(() => {});
+  });
+}

@@ -1,32 +1,191 @@
-import { useEffect, useMemo, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { applyOutcome, applyPending, pendingCount, sqlNow, syncQueue } from "../../../src/shared/offline";
+import type { PendingSale, SendResult } from "../../../src/shared/offline";
 import { computePayment, parseEuro } from "../../../src/shared/money";
 import { ApiError, api, errMsg, go } from "../api";
 import { fmtTime } from "../format";
+import { clearCachedState, newSaleId, readCachedState, readQueue, writeCachedState, writeQueue } from "../offlineStore";
 import { shiftReportPdf } from "../pdf";
 import type { Article, CashierState, Report, Sale } from "../types";
 import { MoneyField, Modal, Stat, diffLabel, diffTone, euro, toast } from "../ui";
 
 type Cart = Record<string, number>;
+type BookResult = { change: number; donation: number; total: number; queued: boolean };
+
+/** Fehler, bei denen ein Verkauf nicht verloren geht, sondern später nachgesendet wird */
+const isRetryable = (e: unknown) => e instanceof ApiError && (e.status === 0 || e.status === 401 || e.status === 429 || e.status >= 500);
+
+async function sendOne(s: PendingSale): Promise<SendResult> {
+  try {
+    await api(
+      "/api/cashier/sales",
+      "POST",
+      {
+        id: s.id,
+        shift_id: s.shift_id,
+        offline: true,
+        created_at: s.created_at,
+        items: s.items.map((i) => ({ article_id: i.article_id, qty: i.qty, unit_price_cents: i.unit_price_cents })),
+        paid: s.paid_cents,
+        donation: s.donation_cents,
+      },
+      8000,
+    );
+    return { kind: "ok" };
+  } catch (e) {
+    if (e instanceof ApiError) {
+      if (e.status === 401) return { kind: "auth" };
+      if (isRetryable(e)) return { kind: "retry" };
+      return { kind: "rejected", error: e.message };
+    }
+    return { kind: "retry" };
+  }
+}
 
 export function Cashier() {
-  const [state, setState] = useState<CashierState | null>(null);
+  const [server, setServer] = useState<CashierState | null>(() => (navigator.onLine ? null : readCachedState()));
+  const [queue, setQueue] = useState<PendingSale[]>(() => readQueue());
+  const [offline, setOffline] = useState(!navigator.onLine);
+  const [authLost, setAuthLost] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [pendingOpen, setPendingOpen] = useState(false);
   const [cart, setCart] = useState<Cart>({});
   const [pay, setPay] = useState(false);
-  const [result, setResult] = useState<{ change: number; donation: number; total: number } | null>(null);
+  const [result, setResult] = useState<BookResult | null>(null);
   const [history, setHistory] = useState(false);
   const [closing, setClosing] = useState(false);
 
-  async function load() {
+  // Aktuelle Werte für Zeitgeber und Browser-Ereignisse (deren Funktionen sonst veraltete Werte sehen würden)
+  const serverRef = useRef(server);
+  serverRef.current = server;
+  const offlineRef = useRef(offline);
+  offlineRef.current = offline;
+  const syncingRef = useRef(false);
+
+  async function load(): Promise<CashierState | null> {
     try {
-      setState(await api<CashierState>("/api/cashier/state"));
+      const s = await api<CashierState>("/api/cashier/state", "GET", undefined, 8000);
+      writeCachedState(s);
+      setServer(s);
+      setOffline(false);
+      setAuthLost(false);
+      return s;
     } catch (e) {
-      if (e instanceof ApiError && e.status === 401) return go("/");
+      if (e instanceof ApiError && e.status === 401) {
+        if (readQueue().length > 0) toast("Sitzung abgelaufen. Bitte den Code neu eingeben, wartende Verkäufe bleiben gespeichert.", "err");
+        go("/");
+        return null;
+      }
+      if (e instanceof ApiError && e.status === 0) {
+        setOffline(true);
+        setServer((cur) => cur ?? readCachedState());
+        return null;
+      }
       toast(errMsg(e), "err");
+      return null;
     }
   }
+
+  /** Wartende Verkäufe an den Server senden. Danach frischen Stand holen und beides gemeinsam übernehmen. */
+  async function sync(shiftIdArg?: string) {
+    const shiftId = shiftIdArg ?? serverRef.current?.shift.id;
+    if (!shiftId || syncingRef.current) return;
+    const snapshot = readQueue();
+    if (!snapshot.some((q) => q.shift_id === shiftId && q.status === "pending")) return;
+    syncingRef.current = true;
+    setSyncing(true);
+    try {
+      const out = await syncQueue(snapshot, shiftId, sendOne);
+      setAuthLost(out.stoppedBy === "auth");
+      if (out.stoppedBy === "retry") setOffline(true);
+      else if (out.stoppedBy === null) setOffline(false);
+      if (out.synced === 0 && out.rejected === 0) return;
+
+      let fresh: CashierState | null = null;
+      try {
+        fresh = await api<CashierState>("/api/cashier/state", "GET", undefined, 8000);
+      } catch {
+        /* Verbindung wieder weg: übertragene Verkäufe bleiben vorerst in der Liste, beim nächsten Mal sind sie sofort "doppelt" und werden ignoriert */
+      }
+      // Neu hinzugekommene Verkäufe bleiben erhalten, deshalb auf die aktuell gespeicherte Liste anwenden
+      const merged = applyOutcome(readQueue(), fresh ? out : { syncedIds: [], rejectedById: out.rejectedById });
+      writeQueue(merged);
+      setQueue(merged);
+      if (fresh) {
+        writeCachedState(fresh);
+        setServer(fresh);
+        if (out.synced > 0) toast(`${out.synced} wartende${out.synced === 1 ? "r Verkauf" : " Verkäufe"} übertragen ✓`);
+      }
+      if (out.rejected > 0) toast(`${out.rejected} Verkauf abgelehnt. Bitte unter „wartende Verkäufe“ prüfen.`, "err");
+    } finally {
+      syncingRef.current = false;
+      setSyncing(false);
+    }
+  }
+
   useEffect(() => {
-    load();
+    load().then((s) => s && sync(s.shift.id));
+    const goOnline = () => {
+      setOffline(false);
+      load().then((s) => s && sync(s.shift.id));
+    };
+    const goOffline = () => setOffline(true);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    // Auch ohne Browser-Meldung regelmäßig prüfen (WLAN mit Verbindung, aber ohne Internet)
+    const timer = setInterval(() => {
+      const shiftId = serverRef.current?.shift.id;
+      if (shiftId && readQueue().some((q) => q.shift_id === shiftId && q.status === "pending")) sync(shiftId);
+      else if (offlineRef.current) load();
+    }, 15000);
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+      clearInterval(timer);
+    };
   }, []);
+
+  /** Verkauf buchen. Ohne Verbindung wird er auf dem Gerät gespeichert und später nachgesendet. */
+  async function book(lines: { a: Article; qty: number }[], paid: number, donation: number, change: number): Promise<BookResult> {
+    const shiftId = serverRef.current!.shift.id;
+    const id = newSaleId();
+    const createdAt = sqlNow();
+    const total = lines.reduce((sum, l) => sum + l.a.price_cents * l.qty, 0);
+    try {
+      const r = await api<{ change: number; donation: number; total: number }>(
+        "/api/cashier/sales",
+        "POST",
+        { id, shift_id: shiftId, items: lines.map((l) => ({ article_id: l.a.id, qty: l.qty })), paid, donation },
+        8000,
+      );
+      setOffline(false);
+      return { ...r, queued: false };
+    } catch (e) {
+      if (!isRetryable(e)) throw e;
+      const sale: PendingSale = {
+        id,
+        shift_id: shiftId,
+        created_at: createdAt,
+        items: lines.map((l) => ({ article_id: l.a.id, name: l.a.name, emoji: l.a.emoji, unit_price_cents: l.a.price_cents, qty: l.qty })),
+        total_cents: total,
+        donation_cents: donation,
+        paid_cents: paid,
+        change_cents: change,
+        status: "pending",
+      };
+      const next = [...readQueue(), sale];
+      if (!writeQueue(next)) {
+        throw new Error("Der Verkauf konnte nicht auf dem Gerät gespeichert werden (Speicher voll oder gesperrt). Bitte Verbindung prüfen.");
+      }
+      setQueue(next);
+      if (e instanceof ApiError && e.status === 0) setOffline(true);
+      if (e instanceof ApiError && e.status === 401) setAuthLost(true);
+      return { change, donation, total, queued: true };
+    }
+  }
+
+  const state = useMemo(() => (server ? applyPending(server, queue) : null), [server, queue]);
+  const counts = pendingCount(queue, server?.shift.id ?? "");
 
   const byId = useMemo(() => new Map((state?.articles ?? []).map((a) => [a.id, a])), [state]);
   const lines = Object.entries(cart)
@@ -41,13 +200,24 @@ export function Cashier() {
         <div class="topbar">
           <h1>SV-Kasse</h1>
         </div>
-        <p class="empty">Lade …</p>
+        {offline ? (
+          <div class="page">
+            <p class="empty">Keine Verbindung. Beim ersten Start auf diesem Gerät wird Internet benötigt.</p>
+            <p style="text-align:center">
+              <button class="btn primary" onClick={() => load()}>
+                Erneut versuchen
+              </button>
+            </p>
+          </div>
+        ) : (
+          <p class="empty">Lade …</p>
+        )}
       </>
     );
   }
 
   if (state.shift.status === "closed") {
-    return <ClosedScreen state={state} />;
+    return <ClosedScreen state={state} unbooked={queue.filter((q) => q.shift_id === state.shift.id)} />;
   }
 
   const { shift, totals, settings } = state;
@@ -66,7 +236,9 @@ export function Cashier() {
   }
 
   async function logout() {
+    if (counts.pending > 0 && !confirm(`${counts.pending} Verkauf/Verkäufe sind noch nicht übertragen. Sie bleiben gespeichert und werden nach erneuter Anmeldung mit demselben Code gesendet. Trotzdem abmelden?`)) return;
     await api("/api/cashier/logout", "POST").catch(() => {});
+    clearCachedState();
     go("/");
   }
 
@@ -84,6 +256,35 @@ export function Cashier() {
           Kasse abschließen
         </button>
       </div>
+
+      {(offline || counts.pending > 0 || counts.rejected > 0 || authLost) && (
+        <div class={`netbar ${counts.rejected > 0 || authLost ? "bad" : ""}`} role="status">
+          <span>
+            {authLost
+              ? "Sitzung abgelaufen: Gerät abmelden und den Code neu eingeben."
+              : offline
+                ? "Offline: Verkäufe werden auf dem Gerät gespeichert."
+                : counts.pending > 0
+                  ? syncing
+                    ? "Übertrage wartende Verkäufe …"
+                    : "Wartende Verkäufe werden übertragen."
+                  : "Es gibt abgelehnte Verkäufe."}
+            {counts.pending > 0 && ` ${counts.pending} wartend.`}
+            {counts.rejected > 0 && ` ${counts.rejected} abgelehnt.`}
+          </span>
+          <span class="sp" />
+          {(counts.pending > 0 || counts.rejected > 0) && (
+            <button class="btn sm" onClick={() => setPendingOpen(true)}>
+              Ansehen
+            </button>
+          )}
+          {counts.pending > 0 && !authLost && (
+            <button class="btn sm" disabled={syncing} onClick={() => load().then((s) => s && sync(s.shift.id))}>
+              Jetzt senden
+            </button>
+          )}
+        </div>
+      )}
 
       <div class="page">
         <div class="stats">
@@ -176,14 +377,19 @@ export function Cashier() {
             setPay(false);
             setCart({});
             setResult(r);
-            load();
+            if (!r.queued) load();
           }}
-          lines={lines.map((l) => ({ article_id: l.a.id, qty: l.qty }))}
+          book={(paid, donation, change) => book(lines, paid, donation, change)}
         />
       )}
 
       {result && (
-        <Modal title="Verkauf gebucht ✓">
+        <Modal title={result.queued ? "Verkauf gespeichert ✓" : "Verkauf gebucht ✓"}>
+          {result.queued && (
+            <p class="muted" style="margin-top:0">
+              Keine Verbindung: Der Verkauf liegt auf dem Gerät und wird automatisch übertragen.
+            </p>
+          )}
           <div class="changebox">
             {result.change > 0 ? (
               <>
@@ -201,8 +407,21 @@ export function Cashier() {
         </Modal>
       )}
 
-      {history && <HistoryModal sales={state.sales} onClose={() => setHistory(false)} onChanged={load} />}
-      {closing && <CloseModal state={state} onClose={() => setClosing(false)} onClosed={load} />}
+      {history && <HistoryModal sales={state.sales} offline={offline} onClose={() => setHistory(false)} onChanged={load} />}
+      {closing && <CloseModal state={state} blocked={counts.pending + counts.rejected} syncing={syncing} onSync={() => load().then((s) => s && sync(s.shift.id))} onClose={() => setClosing(false)} onClosed={load} />}
+      {pendingOpen && (
+        <PendingModal
+          queue={queue.filter((q) => q.shift_id === state.shift.id)}
+          syncing={syncing}
+          onSync={() => load().then((s) => s && sync(s.shift.id))}
+          onDiscard={(id) => {
+            const next = readQueue().filter((q) => q.id !== id);
+            writeQueue(next);
+            setQueue(next);
+          }}
+          onClose={() => setPendingOpen(false)}
+        />
+      )}
     </>
   );
 }
@@ -211,9 +430,9 @@ export function Cashier() {
 function PayModal(props: {
   total: number;
   quick: number[];
-  lines: { article_id: string; qty: number }[];
+  book: (paid: number, donation: number, change: number) => Promise<BookResult>;
   onClose: () => void;
-  onDone: (r: { change: number; donation: number; total: number }) => void;
+  onDone: (r: BookResult) => void;
 }) {
   const { total } = props;
   const [paidStr, setPaidStr] = useState("");
@@ -241,12 +460,7 @@ function PayModal(props: {
     if (!p.ok || paidInvalid) return;
     setBusy(true);
     try {
-      const r = await api<{ change: number; donation: number; total: number }>("/api/cashier/sales", "POST", {
-        items: props.lines,
-        paid: p.paid,
-        donation: p.donation,
-      });
-      props.onDone(r);
+      props.onDone(await props.book(p.paid, p.donation, p.change));
     } catch (e) {
       toast(errMsg(e), "err");
       setBusy(false);
@@ -333,7 +547,7 @@ function PayModal(props: {
 }
 
 // ---------- Verkäufe / Storno ----------
-function HistoryModal(props: { sales: Sale[]; onClose: () => void; onChanged: () => void }) {
+function HistoryModal(props: { sales: Sale[]; offline: boolean; onClose: () => void; onChanged: () => void }) {
   const [voiding, setVoiding] = useState<string | null>(null);
   const [reason, setReason] = useState("");
 
@@ -376,8 +590,10 @@ function HistoryModal(props: { sales: Sale[]; onClose: () => void; onChanged: ()
                     <td class="right">
                       {s.voided_at ? (
                         <span class="pill bad">storniert</span>
+                      ) : s.pending ? (
+                        <span class="pill warn">wartet auf Übertragung</span>
                       ) : (
-                        <button class="btn sm danger" onClick={() => setVoiding(s.id)}>
+                        <button class="btn sm danger" disabled={props.offline} title={props.offline ? "Stornieren geht nur mit Verbindung" : undefined} onClick={() => setVoiding(s.id)}>
                           Stornieren
                         </button>
                       )}
@@ -409,7 +625,7 @@ function HistoryModal(props: { sales: Sale[]; onClose: () => void; onChanged: ()
 }
 
 // ---------- Abschluss ----------
-function CloseModal(props: { state: CashierState; onClose: () => void; onClosed: () => void }) {
+function CloseModal(props: { state: CashierState; blocked: number; syncing: boolean; onSync: () => void; onClose: () => void; onClosed: () => void }) {
   const { totals, shift } = props.state;
   const [counted, setCounted] = useState("");
   const [note, setNote] = useState("");
@@ -452,6 +668,14 @@ function CloseModal(props: { state: CashierState; onClose: () => void; onClosed:
           <span>{euro(totals.expected)}</span>
         </div>
       </div>
+      {props.blocked > 0 && (
+        <div class="netbar bad" style="border-radius:10px;margin-bottom:.8rem">
+          <span>{props.blocked} Verkauf/Verkäufe sind noch nicht übertragen. Die Kasse kann erst geschlossen werden, wenn alles beim Server angekommen ist.</span>
+          <button class="btn sm" disabled={props.syncing} onClick={props.onSync}>
+            Jetzt senden
+          </button>
+        </div>
+      )}
       <MoneyField label="Gezählter Kassenbestand" value={counted} onInput={setCounted} autofocus />
       {diff != null && (
         <div class="stats">
@@ -462,14 +686,14 @@ function CloseModal(props: { state: CashierState; onClose: () => void; onClosed:
         <span>Anmerkung (optional)</span>
         <input type="text" value={note} maxLength={500} onInput={(e) => setNote((e.target as HTMLInputElement).value)} />
       </label>
-      <button class="btn primary big" disabled={busy || cents == null} onClick={submit}>
+      <button class="btn primary big" disabled={busy || cents == null || props.blocked > 0} onClick={submit}>
         {busy ? "Schließe …" : "Kasse endgültig schließen"}
       </button>
     </Modal>
   );
 }
 
-function ClosedScreen({ state }: { state: CashierState }) {
+function ClosedScreen({ state, unbooked }: { state: CashierState; unbooked: PendingSale[] }) {
   const [busy, setBusy] = useState(false);
   const { totals, shift } = state;
 
@@ -485,6 +709,7 @@ function ClosedScreen({ state }: { state: CashierState }) {
   }
   async function leave() {
     await api("/api/cashier/logout", "POST").catch(() => {});
+    clearCachedState();
     go("/");
   }
 
@@ -505,6 +730,14 @@ function ClosedScreen({ state }: { state: CashierState }) {
         <div class="stats" style="text-align:left">
           <Stat label="Differenz" value={diffLabel(totals.difference)} tone={diffTone(totals.difference)} />
         </div>
+        {unbooked.length > 0 && (
+          <div class="netbar bad" style="border-radius:10px;margin:.8rem 0;text-align:left">
+            <span>
+              {unbooked.length} Verkauf/Verkäufe wurden nicht mehr gebucht, weil die Kasse schon geschlossen war ({euro(unbooked.reduce((n, q) => n + q.total_cents + q.donation_cents, 0))}). Das Geld ist in der Kasse, steht aber nicht im Bericht. Bitte der Aufsicht melden:
+              {unbooked.map((q) => ` ${fmtTime(q.created_at)} ${q.items.map((i) => `${i.qty}× ${i.name}`).join(", ")}`).join(";")}
+            </span>
+          </div>
+        )}
         <button class="btn primary big" disabled={busy} onClick={pdf}>
           {busy ? "Erstelle PDF …" : "PDF-Kassenbericht herunterladen"}
         </button>
@@ -515,5 +748,69 @@ function ClosedScreen({ state }: { state: CashierState }) {
         </p>
       </div>
     </main>
+  );
+}
+
+// ---------- Wartende Verkäufe ----------
+function PendingModal(props: { queue: PendingSale[]; syncing: boolean; onSync: () => void; onDiscard: (id: string) => void; onClose: () => void }) {
+  const [confirm, setConfirm] = useState<string | null>(null);
+  return (
+    <Modal title="Wartende Verkäufe" onClose={props.onClose} wide>
+      {props.queue.length === 0 ? (
+        <p class="empty">Alles übertragen ✓</p>
+      ) : (
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Zeit</th>
+                <th>Artikel</th>
+                <th class="num">Summe</th>
+                <th>Status</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {props.queue.map((q) => (
+                <tr key={q.id}>
+                  <td class="nowrap">{fmtTime(q.created_at)}</td>
+                  <td>{q.items.map((i) => `${i.qty}× ${i.name}`).join(", ")}</td>
+                  <td class="num">{euro(q.total_cents + q.donation_cents)}</td>
+                  <td>
+                    {q.status === "pending" ? (
+                      <span class="pill warn">wartet</span>
+                    ) : (
+                      <>
+                        <span class="pill bad">abgelehnt</span>
+                        <br />
+                        <small>{q.error}</small>
+                      </>
+                    )}
+                  </td>
+                  <td class="right">
+                    {q.status === "rejected" &&
+                      (confirm === q.id ? (
+                        <button class="btn sm danger" onClick={() => props.onDiscard(q.id)}>
+                          Wirklich verwerfen
+                        </button>
+                      ) : (
+                        <button class="btn sm" onClick={() => setConfirm(q.id)}>
+                          Verwerfen
+                        </button>
+                      ))}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <p class="muted">
+        Abgelehnte Verkäufe wurden vom Server nicht gebucht (zum Beispiel weil die Kasse inzwischen geschlossen wurde). Das Geld dafür ist trotzdem in der Kasse: bitte der Aufsicht melden, bevor ein Verkauf verworfen wird.
+      </p>
+      <button class="btn primary big" disabled={props.syncing || !props.queue.some((q) => q.status === "pending")} onClick={props.onSync}>
+        {props.syncing ? "Sende …" : "Jetzt senden"}
+      </button>
+    </Modal>
   );
 }

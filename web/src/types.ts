@@ -50,6 +50,8 @@ export interface Sale {
   voided_at: string | null;
   void_reason: string | null;
   items: SaleItem[];
+  /** nur im Browser: Verkauf wurde offline gebucht und wartet auf die Übertragung */
+  pending?: boolean;
 }
 
 export interface Shift {

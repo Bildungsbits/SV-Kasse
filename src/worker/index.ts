@@ -284,18 +284,61 @@ app.get("/api/cashier/state", requireCashier, async (c) => {
   });
 });
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SQL_TIME_RE = /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/;
+
+interface SaleBody {
+  id?: string;
+  shift_id?: string;
+  /** true: Verkauf wurde ohne Verbindung gebucht und wird nachgereicht (Kunde hat schon bezahlt) */
+  offline?: boolean;
+  created_at?: string;
+  items?: { article_id: string; qty: number; unit_price_cents?: number }[];
+  paid?: number;
+  donation?: number;
+}
+
+async function existingSale(db: D1Database, id: string) {
+  return db
+    .prepare("SELECT shift_id, total_cents, donation_cents, paid_cents, change_cents FROM sales WHERE id = ?")
+    .bind(id)
+    .first<{ shift_id: string; total_cents: number; donation_cents: number; paid_cents: number; change_cents: number }>();
+}
+
 app.post("/api/cashier/sales", requireCashier, async (c) => {
   const db = c.env.DB;
-  const shift = await db.prepare("SELECT status, project_id FROM shifts WHERE id = ?").bind(c.get("shiftId")).first<{ status: string; project_id: string | null }>();
+  const shiftId = c.get("shiftId")!;
+  const b = await body<SaleBody>(c);
+  if (!b || !Array.isArray(b.items) || b.items.length === 0) return bad(c, "Warenkorb ist leer");
+  if (b.shift_id !== undefined && b.shift_id !== shiftId) return bad(c, "Der Verkauf gehört zu einer anderen Kasse", 409);
+
+  // Die Verkaufs-ID vergibt das Gerät. Wird derselbe Verkauf nach einem Verbindungsabbruch noch einmal gesendet,
+  // wird er nicht doppelt gebucht, sondern das gespeicherte Ergebnis zurückgegeben.
+  let saleId: string = crypto.randomUUID();
+  if (b.id !== undefined) {
+    if (typeof b.id !== "string" || !UUID_RE.test(b.id)) return bad(c, "Ungültige Verkaufs-ID");
+    saleId = b.id.toLowerCase();
+    const dup = await existingSale(db, saleId);
+    if (dup) {
+      if (dup.shift_id !== shiftId) return bad(c, "Verkaufs-ID ist bereits vergeben", 409);
+      return c.json({ ok: true, id: saleId, duplicate: true, total: dup.total_cents, donation: dup.donation_cents, paid: dup.paid_cents, change: dup.change_cents });
+    }
+  }
+
+  const shift = await db
+    .prepare("SELECT status, project_id, created_at, opened_at FROM shifts WHERE id = ?")
+    .bind(shiftId)
+    .first<{ status: string; project_id: string | null; created_at: string; opened_at: string | null }>();
   if (shift?.status !== "open") return bad(c, "Die Kasse ist geschlossen", 409);
 
-  const b = await body<{ items?: { article_id: string; qty: number }[]; paid?: number; donation?: number }>(c);
-  if (!b || !Array.isArray(b.items) || b.items.length === 0) return bad(c, "Warenkorb ist leer");
-
+  const offline = b.offline === true;
   const qtyById = new Map<string, number>();
+  const priceById = new Map<string, number>();
   for (const i of b.items) {
     if (typeof i.article_id !== "string" || !isInt(i.qty) || i.qty < 1 || i.qty > 999) return bad(c, "Ungültige Menge");
     qtyById.set(i.article_id, (qtyById.get(i.article_id) ?? 0) + i.qty);
+    // Nachgereichter Verkauf: der Preis gilt, den der Kunde an der Kasse gesehen hat
+    if (offline && isInt(i.unit_price_cents) && i.unit_price_cents >= 0 && i.unit_price_cents <= 1_000_000) priceById.set(i.article_id, i.unit_price_cents);
   }
   const ids = [...qtyById.keys()];
   const rows = await db
@@ -308,9 +351,12 @@ app.post("/api/cashier/sales", requireCashier, async (c) => {
   let total = 0;
   for (const a of rows.results) {
     const qty = qtyById.get(a.id)!;
-    if (!a.active) return bad(c, `„${a.name}“ ist nicht mehr verfügbar`, 409);
-    if (a.stock < qty) return bad(c, `„${a.name}“: nur noch ${a.stock} auf Lager`, 409);
-    total += a.price_cents * qty;
+    // Offline schon verkaufte Ware wird immer gebucht, auch wenn sie inzwischen ausverkauft oder deaktiviert ist
+    if (!offline) {
+      if (!a.active) return bad(c, `„${a.name}“ ist nicht mehr verfügbar`, 409);
+      if (a.stock < qty) return bad(c, `„${a.name}“: nur noch ${a.stock} auf Lager`, 409);
+    }
+    total += (priceById.get(a.id) ?? a.price_cents) * qty;
   }
 
   const donation = b.donation ?? 0;
@@ -318,24 +364,47 @@ app.post("/api/cashier/sales", requireCashier, async (c) => {
   const pay = computePayment(total, paid, donation);
   if (!pay.ok) return bad(c, pay.error ?? "Zahlung ungültig");
 
-  const saleId = crypto.randomUUID();
+  // Zeitpunkt des Verkaufs: bei nachgereichten Verkäufen die Geräteuhr, begrenzt auf [Kassenstart, jetzt]
+  let createdAt = nowIso();
+  if (offline && typeof b.created_at === "string" && SQL_TIME_RE.test(b.created_at)) {
+    const floor = shift.opened_at ?? shift.created_at;
+    createdAt = b.created_at > createdAt ? createdAt : b.created_at < floor ? floor : b.created_at;
+  }
+
   const stmts: D1PreparedStatement[] = [
     db
       .prepare("INSERT INTO sales (id, shift_id, total_cents, donation_cents, paid_cents, change_cents, created_at) VALUES (?,?,?,?,?,?,?)")
-      .bind(saleId, c.get("shiftId"), total, donation, paid, pay.change, nowIso()),
+      .bind(saleId, shiftId, total, donation, paid, pay.change, createdAt),
   ];
   for (const a of rows.results) {
     const qty = qtyById.get(a.id)!;
-    stmts.push(
-      db.prepare("INSERT INTO sale_items (sale_id, article_id, name, unit_price_cents, qty) VALUES (?,?,?,?,?)").bind(saleId, a.id, a.name, a.price_cents, qty),
-      // CHECK (stock >= 0) lässt die ganze Transaktion scheitern, falls parallel ausverkauft wurde
-      db.prepare("UPDATE articles SET stock = stock - ? WHERE id = ?").bind(qty, a.id),
-      db.prepare("INSERT INTO stock_movements (article_id, delta, reason, sale_id) VALUES (?, ?, 'sale', ?)").bind(a.id, -qty, saleId),
-    );
+    const price = priceById.get(a.id) ?? a.price_cents;
+    stmts.push(db.prepare("INSERT INTO sale_items (sale_id, article_id, name, unit_price_cents, qty) VALUES (?,?,?,?,?)").bind(saleId, a.id, a.name, price, qty));
+    if (offline) {
+      // Bestand wird nie negativ (CHECK in der Datenbank): fehlende Menge wird mit Hinweis vermerkt
+      const taken = Math.min(qty, a.stock);
+      stmts.push(
+        db.prepare("UPDATE articles SET stock = MAX(stock - ?, 0) WHERE id = ?").bind(qty, a.id),
+        db
+          .prepare("INSERT INTO stock_movements (article_id, delta, reason, sale_id, note) VALUES (?, ?, 'sale', ?, ?)")
+          .bind(a.id, -taken, saleId, taken < qty ? `Offline-Verkauf: Bestand reichte nicht (${qty - taken} zu wenig gebucht)` : ""),
+      );
+    } else {
+      stmts.push(
+        // CHECK (stock >= 0) lässt die ganze Transaktion scheitern, falls parallel ausverkauft wurde
+        db.prepare("UPDATE articles SET stock = stock - ? WHERE id = ?").bind(qty, a.id),
+        db.prepare("INSERT INTO stock_movements (article_id, delta, reason, sale_id) VALUES (?, ?, 'sale', ?)").bind(a.id, -qty, saleId),
+      );
+    }
   }
   try {
     await db.batch(stmts);
   } catch {
+    // Parallele Anfrage mit derselben ID war schneller: das ist kein Fehler
+    const dup = b.id !== undefined ? await existingSale(db, saleId) : null;
+    if (dup && dup.shift_id === shiftId) {
+      return c.json({ ok: true, id: saleId, duplicate: true, total: dup.total_cents, donation: dup.donation_cents, paid: dup.paid_cents, change: dup.change_cents });
+    }
     return bad(c, "Bestand hat sich geändert. Bitte Warenkorb prüfen und erneut versuchen.", 409);
   }
   return c.json({ ok: true, id: saleId, total, donation, paid, change: pay.change });
