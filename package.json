@@ -11,7 +11,8 @@
     "db:migrate:remote": "wrangler d1 migrations apply sv-kasse --remote",
     "deploy": "npm run build && wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --root ."
+    "test": "vitest run --root .",
+    "docs:pdf": "node scripts/anleitung-pdf.mjs"
   },
   "dependencies": {
     "hono": "^4.13.17",
