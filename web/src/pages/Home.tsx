@@ -41,7 +41,7 @@ export function Home() {
         {title.school_name && <p class="muted">{title.school_name}</p>}
         <form onSubmit={submit} style="margin-top:1.4rem">
           <label class="field">
-            <span>Kassencode der Lehrkraft</span>
+            <span>Kassencode</span>
             <input
               class="code-input"
               type="text"

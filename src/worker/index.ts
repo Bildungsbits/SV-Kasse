@@ -238,7 +238,7 @@ app.get("/api/public/settings", async (c) => {
   return c.json({ school_name: s.school_name, sv_name: s.sv_name });
 });
 
-// ---------- Kasse (Lehrkraft-Code) ----------
+// ---------- Kasse (Kassencode) ----------
 app.post("/api/cashier/login", async (c) => {
   if (!secret(c)) return bad(c, "SESSION_SECRET ist nicht konfiguriert", 403);
   if (await tooManyFails(c)) return bad(c, "Zu viele Fehlversuche. Bitte in 10 Minuten erneut versuchen.", 429);

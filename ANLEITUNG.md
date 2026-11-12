@@ -5,7 +5,7 @@ Kassensystem für die Schülervertretung. Läuft auf Cloudflare (Worker + D1-Dat
 ## So wird verkauft (Alltag)
 
 1. **Admin** (`/#/admin`) → Reiter *Schichten* → *+ Neue Schicht*: Name der Pause (z. B. „1. große Pause“) und Startbetrag (Wechselgeld) eingeben. Der **Code** wird angezeigt.
-2. Die Lehrkraft gibt den Code am Verkaufsgerät auf der Startseite ein → die Kasse ist aktiv.
+2. Das Verkaufsteam gibt den Kassencode am Verkaufsgerät auf der Startseite ein → die Kasse ist aktiv.
 3. Verkaufen: Artikel antippen → *Bezahlen* → Betrag wählen, optional **SV-Spende** (Mehrbetrag) → *Verkauf buchen*.
 4. Fehler? *Verkäufe* → *Stornieren* (mit Grund; der Bestand wird zurückgebucht).
 5. Pausenende: *Kasse abschließen* → Bargeld zählen → die Differenz zum Soll wird angezeigt → **PDF-Kassenbericht** herunterladen. Danach ist der Code ungültig.

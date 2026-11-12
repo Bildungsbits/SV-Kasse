@@ -446,7 +446,7 @@ function Shifts({ pid, readOnly }: PW) {
       <div class="row between" style="margin-bottom:1rem">
         <div>
           <h2>Kassenschichten</h2>
-          <small>Pro Pause eine Schicht anlegen, den Code an die Lehrkraft am Verkaufsgerät geben.</small>
+          <small>Kassenschichten hier anlegen und den Kassencode an das Verkaufsteam geben.</small>
         </div>
         {!readOnly && (
           <button class="btn primary" onClick={() => setCreate(true)}>
@@ -531,7 +531,7 @@ function Shifts({ pid, readOnly }: PW) {
       {created && (
         <Modal title={`Code für „${created.name}“`} onClose={() => setCreated(null)}>
           <p class="muted" style="margin-top:0">
-            Diesen Code gibt die Lehrkraft am Verkaufsgerät auf der Startseite ein.
+            Diesen Kassencode gibt das Verkaufsteam am Verkaufsgerät auf der Startseite ein.
           </p>
           <div class="bigcode">{created.code}</div>
           <button class="btn primary big" onClick={() => setCreated(null)}>
