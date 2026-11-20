@@ -47,7 +47,7 @@ doc.setTextColor(255, 255, 255);
 doc.setFont("helvetica", "bold").setFontSize(21).text("So verkaufst du mit der SV-Kasse", 105, 33);
 doc.setFont("helvetica", "normal").setFontSize(10.5);
 doc.text("Anleitung für das Verkaufsteam der SV · HB-BK", 105, 49);
-doc.text("sv-kasse.fikiri.de", 105, 63);
+doc.text("sv-kasse.bildungsbits.de", 105, 63);
 
 // ---------- Bausteine ----------
 function heading(x, y, n, title, w = COLW) {
@@ -81,7 +81,7 @@ const TOP = HEAD + 16;
 
 let yl = TOP;
 yl = section(left, yl, 1, "Kasse starten", [
-  "Öffne auf dem Tablet oder Handy die Seite sv-kasse.fikiri.de.",
+  "Öffne auf dem Tablet oder Handy die Seite sv-kasse.bildungsbits.de.",
   "Gib den Kassencode ein, den du bekommen hast, und tippe auf „Kasse starten“. Der Code gilt nur für diese eine Pause.",
   "Oben siehst du: Kassenbestand (soll), Verkäufe, SV-Spenden und den Startbetrag.",
   "Tipp: Lege die Seite vorher auf den Home-Bildschirm und öffne sie einmal mit Internet. Dann startet die Kasse auch ohne Netz.",
