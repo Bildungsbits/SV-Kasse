@@ -5,6 +5,7 @@ import { Toaster } from "./ui";
 import { Home } from "./pages/Home";
 import { Cashier } from "./pages/Cashier";
 import { Admin } from "./pages/Admin";
+import { Impressum } from "./pages/Impressum";
 
 function route(): string {
   return location.hash.replace(/^#/, "") || "/";
@@ -20,7 +21,15 @@ function App() {
 
   return (
     <>
-      {path.startsWith("/admin") ? <Admin /> : path.startsWith("/kasse") ? <Cashier /> : <Home />}
+      {path.startsWith("/admin") ? (
+        <Admin />
+      ) : path.startsWith("/kasse") ? (
+        <Cashier />
+      ) : path.startsWith("/impressum") ? (
+        <Impressum />
+      ) : (
+        <Home />
+      )}
       <Toaster />
     </>
   );

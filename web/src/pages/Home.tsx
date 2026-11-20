@@ -72,6 +72,10 @@ export function Home() {
           <a href="#/admin" class="muted">
             Adminbereich für Lehrkräfte
           </a>
+          {" · "}
+          <a href="#/impressum" class="muted">
+            Impressum
+          </a>
         </p>
       </div>
     </main>
